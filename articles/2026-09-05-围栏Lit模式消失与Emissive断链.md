@@ -1,48 +1,69 @@
-# 围栏在 Lit 渲染模式下消失：一条被 Python 静默改断的 Emissive 链
+# 围栏在 Lit 渲染模式下消失：断掉的链条，API 一个字都没提
 
-> 现象一句话：视口 Unlit 模式下围栏颜色完美，一切到 Lit 游戏渲染，围栏整个消失——不是变黑，是透明到不存在。
+## 先说结论，给赶时间的人
 
-## 现象
+**一个返回 `False` 的 API，能让你的材质悄悄变成全透明，而且日志里什么都不会有。**
 
-2026-09-05，场景视觉调整。当时的目标很单纯：给电子围栏的材质（M_FenceYellow / M_FenceRed）加一点边缘发光效果，让它在低空场景里更醒目。
+如果你在 UE 里用 Python 脚本改材质节点，这篇能帮你少熬一个通宵。
 
-用 Python 脚本做了三件事：改 UNLIT、加 Fresnel 节点、加 EdgeBoost 节点。脚本跑完，日志确认 `ShadingModel=0 (UNLIT)` 生效，材质也落盘了。
+## 当时发生了什么
 
-然后开 PIE 一看：Unlit 视口下围栏 A 紫、围栏 B 青绿、地标光柱全都正常；**切换到 Lit 游戏渲染，围栏全部消失**。
+2026-09-05，我在给电子围栏的材质做视觉调整。目标很小：让 M_FenceYellow 和 M_FenceRed 在场景里更醒目一点，加个边缘发光。
 
-## 排查路径
+用 Python 脚本做了三件事：改成 UNLIT、加 Fresnel 节点、加 EdgeBoost 节点。脚本跑完，日志里 `ShadingModel=0 (UNLIT)` 明明白白，材质文件也落盘了。一切看起来都成功了。
 
-**第一猜：UNLIT 没生效。** 查日志，`ShadingModel=0 (UNLIT)` 白纸黑字。推翻。
+开 PIE 一看，人傻了：
 
-**第二猜：颜色链路没接上。** 用 `get_material_property_input_node` 直接查材质的 Emissive 输入端——**Emissive input node = NONE，悬空的**。输出端什么都没接，UNLIT 材质的发光值就是 0，等于全透明。Lit 模式下材质是否可见基本靠光照和自发光贡献，自发光为 0、又没有正常的光照链路，就什么都不剩。
+**Unlit 视口下，围栏 A 是紫的，围栏 B 是青绿的，地标光柱好好立着。切换到 Lit 游戏渲染——围栏没了。**
 
-**第三猜：什么时候断的？** 回看我自己的脚本，STEP5 加 Fresnel 的那一步：要把原 Emissive 链拆开、插入 Fresnel、再重连。拆开和重连用的是 `MaterialEditingLibrary.connect_material_expressions`。
+不是变黑，是消失。透明到像从来没存在过。
 
-把这一步单独拿出来实测：这个 API 在我这个环境里**一律返回 False**——不是偶尔失败，是全部失败，而且不抛异常、不报警告，安安静静地返回 False。另一个材质 M_SceneDarken 上四条连接全 False，是同样的实锤。
+## 我是怎么一步步排除的
 
-串起来就是完整的事故链：
+**第一反应：UNLIT 没生效。** 查日志，`ShadingModel=0` 白纸黑字。这个方向死得最快。
+
+**第二反应：颜色没接上。** 用 `get_material_property_input_node` 去查 Emissive 的输入端——查到的结果是 NONE。悬空的。输出端什么都没接，UNLIT 材质的发光值就是 0，等于全透明。 Lit 渲染下既没有正常光照链路，自发光又是零，就什么都不剩。到这里，"消失"这个现象解释通了。
+
+**第三问：链是什么时候断的？** 回头读自己的脚本。STEP5 那步加 Fresnel，需要把原来的 Emissive 链拆开、插进新节点、再重新连回去。拆开和重连用的是一个 API：`connect_material_expressions`。
+
+我把这一步单独拎出来测：这个 API 在我的环境里**每一次都返回 False**。不是偶尔失败，是每一次。最坑的是——它不抛异常、不警告、不写日志，安安静静返回一个 False，等你发现的时候，材质已经"改完"了。
+
+旁边还有一个佐证：另一个材质 M_SceneDarken，四条连接全部返回 False。不是我哪一步写错了，是这个环境里的这类 API 就是不可靠。
+
+事故链拼起来是这样的：
 
 ```
-原 Emissive 链被拆开 → 重连 API 返回 False → 链没接回去
-→ Emissive 输出悬空 = 0 → UNLIT 发光值 = 0 → 围栏全透明 → "消失"
+脚本拆开了原 Emissive 链
+→ 重连 API 返回 False（没人知道）
+→ 链断着，输出悬空 = 0
+→ UNLIT 发光值 = 0
+→ 围栏全透明 → "消失"
 ```
 
 ## 根因
 
-**UNLIT 化本身没错，错在 Fresnel 修改把 Emissive 链弄断了。**
+UNLIT 化本身没错。错在 Fresnel 那一步把 Emissive 链拆了之后，没接回去——**而 API 用返回 False 的方式告诉我"没接回去"，我却信了"没报错就是成功了"**。
 
-更深一层：Python 的 MaterialEditingLibrary 连接类 API 在我的环境里不可靠——返回 False 不报错，是静默失败。脚本以为自己改完了材质，实际只完成了一半，而日志里什么都看不出来。
+## 怎么修的
 
-## 修复
+回滚 M_FenceYellow / M_FenceRed 的 Fresnel 修改，把原始 Emissive 直连链恢复出来，UNLIT 保留。
 
-回滚 M_FenceYellow / M_FenceRed 的 Fresnel 修改，恢复原始 Emissive 直连链，保留 UNLIT。回滚只能在编辑器里手动核对着做——git 不跟踪 .uasset 二进制资产，没法直接 `git checkout` 回滚。09-06 确认解决。
+回滚只能手动在编辑器里核对做——`.uasset` 不进 git，没有 `git checkout` 可以救我。第二天（09-06）确认恢复。
 
-## 下回怎么做
+## 给看的人一句警醒
 
-- [ ] **禁止再用 Python 改材质节点**——创建和修改材质只走三条路：编辑器手动、C++、蓝图
-- [ ] **返回布尔的 API，一律打印返回值复核**，不信"没报错就是成功了"
-- [ ] **材质修改必须三重验证落盘**：`save_asset` 返回值不可信，要用 `OBJ SAVEPACKAGE` 命令 + 磁盘文件时间戳 + `get_material_property_input_node` 查连接，三样都对才算改完
-- [ ] **改材质前先留原状**（截图或导出），.uasset 不进 git，改坏了没有后悔药
+**返回布尔的 API，不报错不等于成功。** 尤其是批量改资产的脚本——一个 False 混在一堆成功日志里，没人会看见。等你看见的时候，付出的可能是一次"场景里东西莫名其妙消失"的通宵排查。改材质这种动一刀全场景都受影响的操作，宁可慢，不要信。
+
+## 给自己的提醒
+
+> 这次是我亲手写的脚本坑了我自己。以后：Python 不许再碰材质节点；改任何资产前先留原状——uasset 没有后悔药。
+
+## 下回怎么做（checklist，可直接拿走）
+
+- [ ] 创建/修改材质只走三条路：编辑器手动、C++、蓝图。**Python 永不改材质节点**
+- [ ] 返回布尔的 API，**一律打印返回值复核**，"没报错"不算数
+- [ ] 材质修改三重验证才算完：`save_asset` 返回值不可信 → `OBJ SAVEPACKAGE` 命令 + 磁盘时间戳 + `get_material_property_input_node` 查连接
+- [ ] 改材质前留原状（截图或导出）。uasset 不进 git，改坏了没有后悔药
 
 ## 素材出处（均可复验）
 
